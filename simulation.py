@@ -2,274 +2,384 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-# ============================================================
-# 1. PHYSICAL GRID
-# ============================================================
+# =====================================================================
+# 1. PHYSICAL DIMENSIONS & COMPOSITE WALL GRID
+# =====================================================================
 
-wall_thickness = 0.15          # Wall thickness (m)
-dx = 0.01                      # Spatial step (m)
-nx = int(wall_thickness / dx) + 1
+dx = 0.005  # Spatial step: 5 mm
 
+thickness_out_plaster = 0.02  # 20 mm
+thickness_core = 0.15         # 150 mm
+thickness_in_plaster = 0.02   # 20 mm
 
-# ============================================================
-# 2. MATERIAL PROPERTIES
-# ============================================================
+nodes_out_plaster = int(thickness_out_plaster / dx)
+nodes_core = int(thickness_core / dx)
+nodes_in_plaster = int(thickness_in_plaster / dx)
 
-# Traditional mud / Bhunga wall
-k_mud = 0.60                   # Thermal conductivity (W/m·K)
-rho_mud = 1800.0               # Density (kg/m³)
-cp_mud = 1000.0                # Specific heat capacity (J/kg·K)
-alpha_mud = k_mud / (rho_mud * cp_mud)
-
-# Modern concrete wall
-k_concrete = 1.30              # Thermal conductivity (W/m·K)
-rho_concrete = 2300.0           # Density (kg/m³)
-cp_concrete = 880.0             # Specific heat capacity (J/kg·K)
-alpha_concrete = k_concrete / (rho_concrete * cp_concrete)
+nx = nodes_out_plaster + nodes_core + nodes_in_plaster + 1
 
 
-# ============================================================
-# 3. ROOM PROPERTIES
-# ============================================================
-
-room_volume = 3.0 * 3.0 * 3.0
-wall_area = 3.0 * 3.0
-
-rho_air = 1.2                  # Air density (kg/m³)
-cp_air = 1005.0                # Air specific heat capacity (J/kg·K)
-room_air_mass = rho_air * room_volume
-
-h_outside = 20.0               # Exterior convection coefficient
-h_inside = 8.0                 # Interior convection coefficient
+# Material-property profiles across the wall
+k_profile = np.zeros(nx)
+rho_profile = np.zeros(nx)
+cp_profile = np.zeros(nx)
 
 
-# ============================================================
-# 4. TIME CONFIGURATION
-# ============================================================
+# Material properties
+k_plaster = 0.70
+rho_plaster = 1600.0
+cp_plaster = 900.0
 
-dt = 2.0                       # Time step (s)
+k_core = 0.60
+rho_core = 1800.0
+cp_core = 1000.0
+
+
+# Outer plaster layer
+k_profile[:nodes_out_plaster] = k_plaster
+rho_profile[:nodes_out_plaster] = rho_plaster
+cp_profile[:nodes_out_plaster] = cp_plaster
+
+# Mud core
+k_profile[nodes_out_plaster:nodes_out_plaster + nodes_core] = k_core
+rho_profile[nodes_out_plaster:nodes_out_plaster + nodes_core] = rho_core
+cp_profile[nodes_out_plaster:nodes_out_plaster + nodes_core] = cp_core
+
+# Inner plaster layer
+k_profile[nodes_out_plaster + nodes_core:] = k_plaster
+rho_profile[nodes_out_plaster + nodes_core:] = rho_plaster
+cp_profile[nodes_out_plaster + nodes_core:] = cp_plaster
+
+
+# Harmonic-mean conductivities at material interfaces
+k_left_arr = (
+    2 * k_profile[1:-1] * k_profile[:-2]
+    / (k_profile[1:-1] + k_profile[:-2])
+)
+
+k_right_arr = (
+    2 * k_profile[1:-1] * k_profile[2:]
+    / (k_profile[1:-1] + k_profile[2:])
+)
+
+
+# =====================================================================
+# 2. SYNTHETIC BHUJ SUMMER CLIMATE PROFILE
+# =====================================================================
+
+np.random.seed(42)
+
+# Five days of hourly climate input
+hourly_times = np.arange(0, 120)
+
+
+# Idealised daily temperature cycle
+base_diurnal = (
+    33.0
+    + 7.0 * np.sin((hourly_times - 10) * np.pi / 12)
+)
+
+# Slowly varying multi-day temperature component
+heatwave_trend = (
+    2.5 * np.sin(hourly_times * np.pi / 60)
+)
+
+# Synthetic atmospheric variability
+weather_noise = np.random.normal(0, 1.2, 120)
+
+synthetic_hourly_temperatures = (
+    base_diurnal
+    + heatwave_trend
+    + weather_noise
+)
+
+
+# Synthetic wind-speed profile
+base_wind = (
+    4.0
+    + 2.5 * np.sin((hourly_times - 12) * np.pi / 12)
+)
+
+wind_noise = np.abs(
+    np.random.normal(0, 1.8, 120)
+)
+
+synthetic_hourly_winds = np.clip(
+    base_wind + wind_noise,
+    1.0,
+    12.0
+)
+
+
+def get_synthetic_climate(time_in_seconds):
+    """
+    Return the synthetic outdoor temperature and wind speed
+    corresponding to a simulation time.
+
+    Hourly climate values are linearly interpolated to the
+    one-second simulation timestep.
+    """
+
+    current_hour = time_in_seconds / 3600.0
+
+    outdoor_temperature = np.interp(
+        current_hour,
+        hourly_times,
+        synthetic_hourly_temperatures
+    )
+
+    wind_speed = np.interp(
+        current_hour,
+        hourly_times,
+        synthetic_hourly_winds
+    )
+
+    # Simplified external convection coefficient
+    h_outside = 5.7 + 3.8 * wind_speed
+
+    return outdoor_temperature, h_outside
+
+
+# =====================================================================
+# 3. TIME STEPPING & ROOM INITIALISATION
+# =====================================================================
+
+dt = 1.0  # Time step: 1 second
+
 days = 5
 total_time = days * 24 * 3600
 nt = int(total_time / dt)
 
 
-# ============================================================
-# 5. INITIAL CONDITIONS
-# ============================================================
-
+# Initial wall and indoor temperatures
 initial_temperature = 28.0
 
-T_wall_mud = np.ones(nx) * initial_temperature
-T_wall_mud_new = T_wall_mud.copy()
-T_room_mud = initial_temperature
+T_wall = np.ones(nx) * initial_temperature
+T_wall_new = T_wall.copy()
 
-T_wall_concrete = np.ones(nx) * initial_temperature
-T_wall_concrete_new = T_wall_concrete.copy()
-T_room_concrete = initial_temperature
+T_room = initial_temperature
 
 
-# ============================================================
-# 6. SIMPLIFIED BHUJ SUMMER TEMPERATURE MODEL
-# ============================================================
+# Room properties
+room_volume = 3.0 * 3.0 * 3.0
+wall_area = 3.0 * 3.0
 
-def get_outside_temperature(time_in_seconds):
-    """
-    Generate a simplified 24-hour outdoor temperature cycle.
+rho_air = 1.2
+cp_air = 1005.0
 
-    This is a synthetic climate profile rather than measured
-    weather data.
-    """
-    hour = (time_in_seconds / 3600.0) % 24
+room_air_mass = rho_air * room_volume
 
-    average_temperature = 33.0
-    amplitude = 7.0
-
-    return average_temperature + amplitude * np.sin(
-        (hour - 10) * np.pi / 12
-    )
+h_inside = 8.0
 
 
-# ============================================================
-# 7. SIMULATION
-# ============================================================
-
-print("Simulating mud vs. concrete thermal performance...")
-
+# Arrays for recording simulation results
 time_history = np.zeros(nt)
 outside_temperature_history = np.zeros(nt)
-inside_mud_history = np.zeros(nt)
-inside_concrete_history = np.zeros(nt)
+inside_temperature_history = np.zeros(nt)
 
+
+# =====================================================================
+# 4. TRANSIENT HEAT-TRANSFER SIMULATION
+# =====================================================================
+
+print("Running five-day composite-wall thermal simulation...")
 
 for step in range(nt):
 
     current_time = step * dt
-    outside_temperature = get_outside_temperature(current_time)
 
-    # --------------------------------------------------------
-    # MUD / BHUNGA MODEL
-    # --------------------------------------------------------
+    outdoor_temperature, h_outside = (
+        get_synthetic_climate(current_time)
+    )
 
-    conduction_mud = (
-        alpha_mud
-        * dt
-        / dx**2
-        * (
-            T_wall_mud[2:]
-            - 2 * T_wall_mud[1:-1]
-            + T_wall_mud[:-2]
+
+    # -----------------------------------------------------------------
+    # Internal wall conduction
+    # -----------------------------------------------------------------
+
+    heat_flux_left = (
+        k_left_arr
+        * (T_wall[:-2] - T_wall[1:-1])
+        / dx
+    )
+
+    heat_flux_right = (
+        k_right_arr
+        * (T_wall[1:-1] - T_wall[2:])
+        / dx
+    )
+
+    T_wall_new[1:-1] = (
+        T_wall[1:-1]
+        + (
+            dt
+            / (
+                rho_profile[1:-1]
+                * cp_profile[1:-1]
+                * dx
+            )
         )
+        * (heat_flux_left - heat_flux_right)
     )
 
-    T_wall_mud_new[1:-1] = (
-        T_wall_mud[1:-1] + conduction_mud
-    )
 
+    # -----------------------------------------------------------------
     # Exterior boundary
-    T_wall_mud_new[0] = (
-        T_wall_mud[0]
-        + alpha_mud * dt / dx**2
+    # -----------------------------------------------------------------
+
+    heat_flux_outside = (
+        h_outside
+        * (outdoor_temperature - T_wall[0])
+    )
+
+    k_interface_outside = (
+        2
+        * k_profile[0]
+        * k_profile[1]
+        / (k_profile[0] + k_profile[1])
+    )
+
+    conduction_inward = (
+        k_interface_outside
+        * (T_wall[1] - T_wall[0])
+        / dx
+    )
+
+    T_wall_new[0] = (
+        T_wall[0]
+        + (
+            dt
+            / (
+                rho_profile[0]
+                * cp_profile[0]
+                * (dx / 2)
+            )
+        )
         * (
-            2 * T_wall_mud[1]
-            - 2 * T_wall_mud[0]
-            + (2 * dx * h_outside / k_mud)
-            * (outside_temperature - T_wall_mud[0])
+            heat_flux_outside
+            + conduction_inward
         )
     )
 
+
+    # -----------------------------------------------------------------
     # Interior boundary
-    T_wall_mud_new[-1] = (
-        T_wall_mud[-1]
-        + alpha_mud * dt / dx**2
+    # -----------------------------------------------------------------
+
+    heat_flux_inside = (
+        h_inside
+        * (T_wall[-1] - T_room)
+    )
+
+    k_interface_inside = (
+        2
+        * k_profile[-1]
+        * k_profile[-2]
+        / (k_profile[-1] + k_profile[-2])
+    )
+
+    conduction_outward = (
+        k_interface_inside
+        * (T_wall[-2] - T_wall[-1])
+        / dx
+    )
+
+    T_wall_new[-1] = (
+        T_wall[-1]
+        + (
+            dt
+            / (
+                rho_profile[-1]
+                * cp_profile[-1]
+                * (dx / 2)
+            )
+        )
         * (
-            2 * T_wall_mud[-2]
-            - 2 * T_wall_mud[-1]
-            - (2 * dx * h_inside / k_mud)
-            * (T_wall_mud[-1] - T_room_mud)
+            conduction_outward
+            - heat_flux_inside
         )
     )
 
-    # Room air energy balance
-    heat_flux_mud = h_inside * (
-        T_wall_mud[-1] - T_room_mud
-    )
 
-    T_room_mud += (
-        heat_flux_mud
+    # -----------------------------------------------------------------
+    # Indoor air energy balance
+    # -----------------------------------------------------------------
+
+    energy_change = (
+        heat_flux_inside
         * wall_area
         * dt
+    )
+
+    T_room += (
+        energy_change
         / (room_air_mass * cp_air)
     )
 
-    T_wall_mud[:] = T_wall_mud_new
+
+    # Update wall temperatures
+    T_wall[:] = T_wall_new
 
 
-    # --------------------------------------------------------
-    # CONCRETE MODEL
-    # --------------------------------------------------------
-
-    conduction_concrete = (
-        alpha_concrete
-        * dt
-        / dx**2
-        * (
-            T_wall_concrete[2:]
-            - 2 * T_wall_concrete[1:-1]
-            + T_wall_concrete[:-2]
-        )
-    )
-
-    T_wall_concrete_new[1:-1] = (
-        T_wall_concrete[1:-1] + conduction_concrete
-    )
-
-    # Exterior boundary
-    T_wall_concrete_new[0] = (
-        T_wall_concrete[0]
-        + alpha_concrete * dt / dx**2
-        * (
-            2 * T_wall_concrete[1]
-            - 2 * T_wall_concrete[0]
-            + (2 * dx * h_outside / k_concrete)
-            * (outside_temperature - T_wall_concrete[0])
-        )
-    )
-
-    # Interior boundary
-    T_wall_concrete_new[-1] = (
-        T_wall_concrete[-1]
-        + alpha_concrete * dt / dx**2
-        * (
-            2 * T_wall_concrete[-2]
-            - 2 * T_wall_concrete[-1]
-            - (2 * dx * h_inside / k_concrete)
-            * (T_wall_concrete[-1] - T_room_concrete)
-        )
-    )
-
-    # Room air energy balance
-    heat_flux_concrete = h_inside * (
-        T_wall_concrete[-1] - T_room_concrete
-    )
-
-    T_room_concrete += (
-        heat_flux_concrete
-        * wall_area
-        * dt
-        / (room_air_mass * cp_air)
-    )
-
-    T_wall_concrete[:] = T_wall_concrete_new
-
-
-    # --------------------------------------------------------
-    # STORE RESULTS
-    # --------------------------------------------------------
+    # -----------------------------------------------------------------
+    # Store simulation results
+    # -----------------------------------------------------------------
 
     time_history[step] = current_time / 3600.0
-    outside_temperature_history[step] = outside_temperature
-    inside_mud_history[step] = T_room_mud
-    inside_concrete_history[step] = T_room_concrete
+
+    outside_temperature_history[step] = (
+        outdoor_temperature
+    )
+
+    inside_temperature_history[step] = T_room
 
 
-print("Simulation complete.")
+print("Simulation complete. Generating figure...")
 
 
-# ============================================================
-# 8. VISUALISATION
-# ============================================================
+# =====================================================================
+# 5. VISUALISATION
+# =====================================================================
 
-plt.figure(figsize=(12, 7))
+plt.figure(figsize=(14, 7))
 
 plt.plot(
     time_history,
     outside_temperature_history,
-    label="Outdoor temperature",
-    linestyle="--",
-    alpha=0.5
+    label="Outdoor temperature (synthetic Bhuj climate profile)",
+    linestyle="-",
+    alpha=0.45,
+    linewidth=1.5
 )
 
 plt.plot(
     time_history,
-    inside_mud_history,
-    label="Mud / Bhunga room",
-    linewidth=2
+    inside_temperature_history,
+    label="Indoor room temperature",
+    linewidth=2.5
 )
 
-plt.plot(
-    time_history,
-    inside_concrete_history,
-    label="Concrete room",
-    linewidth=2
-)
-
-plt.xlabel("Time (hours)")
+plt.xlabel("Time elapsed (hours)")
 plt.ylabel("Temperature (°C)")
-plt.title("Transient Thermal Comparison: Mud vs. Concrete")
 
-plt.grid(True, alpha=0.3)
-plt.legend()
-plt.xlim(0, total_time / 3600)
+plt.title(
+    "Five-Day Thermal Response of a Composite Mud/Plaster Wall",
+    fontweight="bold"
+)
+
+plt.grid(True, alpha=0.25)
+plt.legend(loc="upper right")
+
+plt.xlim(0, days * 24)
 
 plt.tight_layout()
+
+
+# Save figure for the GitHub repository
+plt.savefig(
+    "composite_wall_response.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
 plt.show()
